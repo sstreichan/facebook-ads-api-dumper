@@ -23,6 +23,7 @@ type Config struct {
 	AccessToken string
 	OutputDir   string
 	Debug       bool
+	MaxPages    int // 0 = unlimited
 }
 
 type AdAccount struct {
@@ -30,6 +31,17 @@ type AdAccount struct {
 	AccountID string `json:"account_id"`
 	Name      string `json:"name"`
 	Currency  string `json:"currency"`
+}
+
+type PaginatedResponse struct {
+	Data   []json.RawMessage `json:"data"`
+	Paging struct {
+		Cursors struct {
+			Before string `json:"before"`
+			After  string `json:"after"`
+		} `json:"cursors"`
+		Next string `json:"next"`
+	} `json:"paging"`
 }
 
 type AdAccountsResponse struct {
@@ -64,6 +76,10 @@ func maskToken(token string) string {
 }
 
 func (c *APIClient) makeRequest(endpoint string) ([]byte, error) {
+	return c.makeRequestWithRetry(endpoint, 0)
+}
+
+func (c *APIClient) makeRequestWithRetry(endpoint string, retryCount int) ([]byte, error) {
 	// Properly construct URL with encoded access token
 	baseEndpoint := fmt.Sprintf("%s/%s", baseURL, endpoint)
 	parsedURL, err := url.Parse(baseEndpoint)
@@ -84,11 +100,10 @@ func (c *APIClient) makeRequest(endpoint string) ([]byte, error) {
 		maskedQuery.Set("access_token", maskToken(c.config.AccessToken))
 		parsedURL.RawQuery = maskedQuery.Encode()
 		log.Printf("[DEBUG] Request URL: %s", parsedURL.String())
-		log.Printf("[DEBUG] Token length: %d characters", len(c.config.AccessToken))
-		log.Printf("[DEBUG] Token prefix: %s", maskToken(c.config.AccessToken))
+		if retryCount > 0 {
+			log.Printf("[DEBUG] Retry attempt: %d", retryCount)
+		}
 	}
-	
-	log.Printf("Requesting: %s", endpoint)
 	
 	resp, err := c.httpClient.Get(finalURL)
 	if err != nil {
@@ -98,12 +113,22 @@ func (c *APIClient) makeRequest(endpoint string) ([]byte, error) {
 	
 	if c.config.Debug {
 		log.Printf("[DEBUG] Response status: %d %s", resp.StatusCode, resp.Status)
-		log.Printf("[DEBUG] Content-Type: %s", resp.Header.Get("Content-Type"))
 	}
 	
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	
+	// Handle rate limiting with exponential backoff
+	if resp.StatusCode == 429 || resp.StatusCode == 17 {
+		if retryCount < 3 {
+			waitTime := time.Duration(1<<uint(retryCount)) * time.Second
+			log.Printf("Rate limit hit, waiting %v before retry...", waitTime)
+			time.Sleep(waitTime)
+			return c.makeRequestWithRetry(endpoint, retryCount+1)
+		}
+		return nil, fmt.Errorf("rate limit exceeded after %d retries", retryCount)
 	}
 	
 	if resp.StatusCode != http.StatusOK {
@@ -126,6 +151,63 @@ func (c *APIClient) makeRequest(endpoint string) ([]byte, error) {
 	}
 	
 	return body, nil
+}
+
+func (c *APIClient) fetchPaginated(baseEndpoint string, resourceName string) ([]json.RawMessage, error) {
+	var allData []json.RawMessage
+	pageCount := 0
+	cursor := ""
+	
+	for {
+		pageCount++
+		
+		// Check if we've hit the max pages limit
+		if c.config.MaxPages > 0 && pageCount > c.config.MaxPages {
+			log.Printf("Reached max pages limit (%d) for %s", c.config.MaxPages, resourceName)
+			break
+		}
+		
+		// Build endpoint with cursor if present
+		endpoint := baseEndpoint
+		if cursor != "" {
+			separator := "&"
+			if !strings.Contains(endpoint, "?") {
+				separator = "?"
+			}
+			endpoint = fmt.Sprintf("%s%safter=%s", endpoint, separator, cursor)
+		}
+		
+		if pageCount > 1 {
+			log.Printf("  Fetching page %d for %s...", pageCount, resourceName)
+		} else {
+			log.Printf("Requesting: %s", endpoint)
+		}
+		
+		data, err := c.makeRequest(endpoint)
+		if err != nil {
+			return nil, err
+		}
+		
+		var response PaginatedResponse
+		if err := json.Unmarshal(data, &response); err != nil {
+			return nil, fmt.Errorf("parsing paginated response: %w", err)
+		}
+		
+		// Append data from this page
+		allData = append(allData, response.Data...)
+		
+		// Check if there's a next page
+		if response.Paging.Cursors.After == "" {
+			if pageCount > 1 {
+				log.Printf("  Completed: fetched %d items across %d pages for %s", len(allData), pageCount, resourceName)
+			}
+			break
+		}
+		
+		cursor = response.Paging.Cursors.After
+	}
+	
+	return allData, nil
 }
 
 func (c *APIClient) dumpResponse(name string, data []byte, accountDir string) error {
@@ -172,6 +254,7 @@ func (c *APIClient) fetchAdAccounts() ([]AdAccount, error) {
 
 func (c *APIClient) fetchAdAccount(accountID string, accountDir string) error {
 	endpoint := fmt.Sprintf("%s?fields=id,name,account_id,currency,timezone_name,business,account_status", accountID)
+	log.Printf("Requesting: %s (ad account details)", accountID)
 	data, err := c.makeRequest(endpoint)
 	if err != nil {
 		return err
@@ -180,34 +263,63 @@ func (c *APIClient) fetchAdAccount(accountID string, accountDir string) error {
 }
 
 func (c *APIClient) fetchCampaigns(accountID string, accountDir string) error {
-	endpoint := fmt.Sprintf("%s/campaigns?fields=id,name,status,objective,created_time,updated_time", accountID)
-	data, err := c.makeRequest(endpoint)
+	endpoint := fmt.Sprintf("%s/campaigns?fields=id,name,status,objective,created_time,updated_time&limit=100", accountID)
+	allData, err := c.fetchPaginated(endpoint, "campaigns")
 	if err != nil {
 		return err
 	}
-	return c.dumpResponse("campaigns", data, accountDir)
+	
+	// Construct aggregated response
+	aggregatedResponse := map[string]interface{}{
+		"data": allData,
+		"summary": map[string]interface{}{
+			"total_count": len(allData),
+		},
+	}
+	
+	responseJSON, _ := json.Marshal(aggregatedResponse)
+	return c.dumpResponse("campaigns", responseJSON, accountDir)
 }
 
 func (c *APIClient) fetchAdSets(accountID string, accountDir string) error {
-	endpoint := fmt.Sprintf("%s/adsets?fields=id,name,status,campaign_id,daily_budget,lifetime_budget,created_time", accountID)
-	data, err := c.makeRequest(endpoint)
+	endpoint := fmt.Sprintf("%s/adsets?fields=id,name,status,campaign_id,daily_budget,lifetime_budget,created_time&limit=100", accountID)
+	allData, err := c.fetchPaginated(endpoint, "adsets")
 	if err != nil {
 		return err
 	}
-	return c.dumpResponse("adsets", data, accountDir)
+	
+	aggregatedResponse := map[string]interface{}{
+		"data": allData,
+		"summary": map[string]interface{}{
+			"total_count": len(allData),
+		},
+	}
+	
+	responseJSON, _ := json.Marshal(aggregatedResponse)
+	return c.dumpResponse("adsets", responseJSON, accountDir)
 }
 
 func (c *APIClient) fetchAds(accountID string, accountDir string) error {
-	endpoint := fmt.Sprintf("%s/ads?fields=id,name,status,adset_id,creative,created_time", accountID)
-	data, err := c.makeRequest(endpoint)
+	endpoint := fmt.Sprintf("%s/ads?fields=id,name,status,adset_id,creative,created_time&limit=100", accountID)
+	allData, err := c.fetchPaginated(endpoint, "ads")
 	if err != nil {
 		return err
 	}
-	return c.dumpResponse("ads", data, accountDir)
+	
+	aggregatedResponse := map[string]interface{}{
+		"data": allData,
+		"summary": map[string]interface{}{
+			"total_count": len(allData),
+		},
+	}
+	
+	responseJSON, _ := json.Marshal(aggregatedResponse)
+	return c.dumpResponse("ads", responseJSON, accountDir)
 }
 
 func (c *APIClient) fetchInsights(accountID string, accountDir string) error {
 	endpoint := fmt.Sprintf("%s/insights?fields=impressions,clicks,spend,ctr,cpc,date_start,date_stop&level=account&time_range={'since':'2026-01-01','until':'2026-02-03'}", accountID)
+	log.Printf("Requesting: insights")
 	data, err := c.makeRequest(endpoint)
 	if err != nil {
 		return err
@@ -264,6 +376,7 @@ func main() {
 	accessToken := flag.String("token", "", "Facebook access token (required)")
 	outputDir := flag.String("output", "", "Output directory for JSON files (optional)")
 	debug := flag.Bool("debug", false, "Enable debug output")
+	maxPages := flag.Int("max-pages", 0, "Maximum pages to fetch per endpoint (0 = unlimited)")
 	flag.Parse()
 	
 	if *accessToken == "" {
@@ -288,11 +401,17 @@ func main() {
 		AccessToken: *accessToken,
 		OutputDir:   *outputDir,
 		Debug:       *debug,
+		MaxPages:    *maxPages,
 	}
 	
 	client := NewAPIClient(config)
 	
 	log.Println("Starting Facebook Ads API data dump...")
+	if config.MaxPages > 0 {
+		log.Printf("Pagination limit: %d pages per endpoint", config.MaxPages)
+	} else {
+		log.Println("Pagination: unlimited (will fetch all pages)")
+	}
 	log.Println("Discovering accessible ad accounts...")
 	
 	// Fetch all accessible ad accounts
